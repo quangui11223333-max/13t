@@ -150,28 +150,55 @@ jobs:
           set -o pipefail
           bash kernel_platform/oplus/build/oplus_build_kernel.sh sun "$VARIANT" 2>&1 | tee build.log
 
+      # 产物路径以 prepare_vendor.sh 头部注释为准（权威）：
+      #   KP_OUT = ${ANDROID_BUILD_TOP}/device/qcom/sun-kernel   ← oplus_setup.sh 把 ANDROID_BUILD_TOP=树根
+      #   $(KP_OUT)/Image            boot.img 用的内核
+      #   $(KP_OUT)/*.ko             所有 DLKM（359 个）
+      #   $(KP_OUT)/modules.load
+      #   $(KP_OUT)/merged-dtbs/     dtb/dtbo
+      # bazel 的中间 dist（kernel_platform/out/<branch>/dist）只是二传手。
       - name: Verify artifacts
         run: |
-          D="$TREE/out/msm-kernel/sun_${VARIANT}/dist"
-          echo "---- dist:"; ls -lh "$D" | head -25 || true
-          echo "---- 也找找别处的产物:"
-          find "$TREE" -name 'boot.img' -o -name 'Image' -o -name 'dtbo.img' 2>/dev/null | head -20
-          [ -f "$D/Image" ] && strings "$D/Image" | grep -m2 'Linux version 6\.6\.' || echo "no Image"
-          echo "---- ko 数量: $(ls "$D"/*.ko 2>/dev/null | wc -l)"
-          [ -f "$D/vendor_dlkm.modules.load" ] && echo "modules.load 行数: $(wc -l < "$D/vendor_dlkm.modules.load")"
+          O="$TREE/device/qcom/sun-kernel"
+          echo "---- device/qcom/sun-kernel:"; ls -lh "$O" 2>/dev/null | head -30 || echo "  目录不存在"
+          echo "---- ko 数量: $(ls "$O"/*.ko 2>/dev/null | wc -l)"
+          echo "---- merged-dtbs:"; ls "$O/merged-dtbs" 2>/dev/null | head -10
+          if [ -f "$O/Image" ]; then
+            ls -lh "$O/Image"
+            strings "$O/Image" | grep -m2 'Linux version 6\.6\.' || echo "  版本串没找到"
+            echo "---- Image header:"; xxd -l 64 "$O/Image" | head -4
+          else
+            echo "!! $O/Image 不存在 —— 编译没走到拷贝环节"
+            echo "---- 兜底搜索:"
+            find "$TREE" -name Image -newermt '-6 hours' 2>/dev/null | head -10
+            find "$TREE" -name '*.ko' 2>/dev/null | head -5
+            exit 1
+          fi
+          echo "---- CONFIG_MODULE_SIG_PROTECT（必须 not set，否则 WiFi/BT 模块加载失败）:"
+          grep -m1 'CONFIG_MODULE_SIG_PROTECT' "$O/.config" 2>/dev/null || \
+            grep -m1 'CONFIG_MODULE_SIG_PROTECT' "$O/build_opts.txt" 2>/dev/null || echo "  (查不到，忽略)"
 
       - name: Collect outputs
         if: always()
         run: |
-          D="$TREE/out/msm-kernel/sun_${VARIANT}/dist"
-          mkdir -p "$GITHUB_WORKSPACE/out-artifacts"
-          cp -v "$D"/Image "$D"/boot.img "$D"/dtbo.img "$D"/vendor_dlkm.modules.load \
-                "$GITHUB_WORKSPACE/out-artifacts/" 2>/dev/null || true
-          cp -rv "$D"/merged-dtbs "$GITHUB_WORKSPACE/out-artifacts/" 2>/dev/null || true
-          mkdir -p "$GITHUB_WORKSPACE/out-artifacts/ko" 2>/dev/null
-          cp -v "$D"/*.ko "$GITHUB_WORKSPACE/out-artifacts/ko/" 2>/dev/null || true
-          cp -v "$TREE/build.log" "$GITHUB_WORKSPACE/out-artifacts/" 2>/dev/null || true
-          du -sh "$GITHUB_WORKSPACE/out-artifacts"; ls -lh "$GITHUB_WORKSPACE/out-artifacts"
+          O="$TREE/device/qcom/sun-kernel"
+          A="$GITHUB_WORKSPACE/out-artifacts"
+          mkdir -p "$A"
+          # 关键文件
+          cp -v "$O"/Image "$O"/System.map "$O"/.config "$O"/build_opts.txt "$A/" 2>/dev/null || true
+          cp -v "$O"/modules.load "$O"/modules.blocklist "$O"/vendor_dlkm.modules.load \
+                "$O"/vendor_boot.modules.load "$A/" 2>/dev/null || true
+          cp -v "$O"/*.img "$A/" 2>/dev/null || true
+          cp -rv "$O"/merged-dtbs "$A/" 2>/dev/null || true
+          # 全部 ko（359 个，压缩后 100 MB 左右）
+          if ls "$O"/*.ko >/dev/null 2>&1; then
+            mkdir -p "$A/ko"; cp -v "$O"/*.ko "$A/ko/" 2>/dev/null | tail -3
+            echo "ko 拷贝数: $(ls "$A/ko" | wc -l)"
+          fi
+          # bazel 中间 dist 也留一份清单，便于对照
+          ls -d "$TREE"/kernel_platform/out/*/dist 2>/dev/null > "$A/dist-dirs.txt" || true
+          cp -v "$TREE/build.log" "$A/" 2>/dev/null || true
+          echo "---- 收集结果:"; du -sh "$A"; ls -lh "$A" | head -20
 
       - name: Upload artifacts
         if: always()
