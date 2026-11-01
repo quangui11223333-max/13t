@@ -118,9 +118,13 @@ def assemble(dep: dict, arch: Path, root: Path) -> None:
             target = root / member.name
             if os.path.lexists(target):
                 continue
+            # filter="data"（py>=3.12 的默认行为）会拒绝"剥掉一层前缀后指向树外"的相对软链，
+            # 例如 kernel_platform/build/android/export_headers.py -> ../../../kernel/...。
+            # 这些链接是官方 tar 按"带顶层目录"拍的相对路径，剥前缀后必然错位；
+            # 它们只影响导航便利性、不影响编译，所以用 fully_trusted 原样解出。
             try:
-                tf.extract(member, path=root, filter="data")
-            except TypeError:  # py < 3.12
+                tf.extract(member, path=root, filter="fully_trusted")
+            except TypeError:  # py < 3.12 没有 filter 参数
                 tf.extract(member, path=root)
             written += 1
     print(f"  assembled {dep['name']:<58} -> {dest_rel}  ({written} entries)", flush=True)
