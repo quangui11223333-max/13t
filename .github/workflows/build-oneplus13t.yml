@@ -94,17 +94,24 @@ jobs:
 
       # oplus_setup.sh 把 JAVA_HOME 写死成 ${TOPDIR}/prebuilts/jdk/jdk21/linux-x86，
       # 但依赖里只有 jdk11，且 prebuilts 在 kernel_platform/ 下而不是树根。
-      # 用两条软链补齐，不改源码（kleaf/workspace.bzl 用的就是 jdk11，版本是对的）。
-      - name: Prepare prebuilts / JAVA_HOME
+      # 用软链补齐，不改源码（kleaf/workspace.bzl 用的就是 jdk11，版本是对的）。
+      # 另外 llvm-binutils-stable/ 里 20 个工具全指向不存在的 clang-r522817，
+      # 而 oplus_setup.sh 的 STRIP 变量就走这条路 —— 一条软链全部修好。
+      - name: Prepare prebuilts / JAVA_HOME / llvm-strip
         run: |
           cd "$TREE"
           [ -e prebuilts ] || ln -sfn "$TREE/kernel_platform/prebuilts" "$TREE/prebuilts"
+          CL="$TREE/kernel_platform/prebuilts/clang/host/linux-x86"
+          if [ ! -d "$CL/clang-r522817" ]; then
+            ln -sfn clang-r510928 "$CL/clang-r522817"
+            echo "linked clang-r522817 -> clang-r510928 (llvm-binutils-stable 依赖它)"
+          fi
           if [ ! -d "$TREE/prebuilts/jdk/jdk21/linux-x86" ]; then
             ln -sfn "$TREE/prebuilts/jdk/jdk11" "$TREE/prebuilts/jdk/jdk21"
             echo "linked jdk21 -> jdk11"
           fi
-          echo "JAVA_HOME candidate:"; ls -l "$TREE/prebuilts/jdk/jdk21/linux-x86/bin/java"
-          "$TREE/prebuilts/jdk/jdk21/linux-x86/bin/java" -version 2>&1 | head -2
+          echo "---- llvm-strip:"; "$CL/llvm-binutils-stable/llvm-strip" --version | head -1
+          echo "---- java:"; "$TREE/prebuilts/jdk/jdk21/linux-x86/bin/java" -version 2>&1 | head -1
 
       - name: Preflight
         run: |
