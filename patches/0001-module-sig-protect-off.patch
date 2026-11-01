@@ -1,0 +1,51 @@
+关闭 OPLUS 的 CONFIG_MODULE_SIG_PROTECT（一加 13T 自编内核第一号必踩坑）
+
+为什么必须关
+------------
+`CONFIG_MODULE_SIG_PROTECT=y` 时，内核只允许加载带 OPLUS 官方签名（或与
+`CONFIG_MODULE_SIG_KEY` 匹配）的模块。自编 Image 的签名键与官方 vendor 模块不同，
+于是 rfkill → cfg80211 → mac80211 → qca_cld3_wlan 这条链在 insmod 阶段被拒，
+表现是**开机正常但 WiFi 和蓝牙全哑**，dmesg 里能看到 module signature / protect 相关拒绝。
+
+两个 tree 都有这一行，必须同时改（只改一个会被另一份 defconfig 覆盖回去）：
+  - kernel_platform/common/arch/arm64/configs/gki_defconfig
+  - kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
+
+保留 `CONFIG_MODULE_SIG=y`（只做签名元数据，不拦截），只把 PROTECT 关掉。
+
+用法（在装配好的树根目录）
+--------------------------
+  patch -p1 < patches/0001-module-sig-protect-off.patch
+  # 或： git apply patches/0001-module-sig-protect-off.patch
+
+验证
+----
+  grep -n 'MODULE_SIG' kernel_platform/common/arch/arm64/configs/gki_defconfig
+  grep -n 'MODULE_SIG' kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
+  # 两处都应是： CONFIG_MODULE_SIG=y  且  # CONFIG_MODULE_SIG_PROTECT is not set
+
+编完再验一次生成的 .config：
+  grep 'MODULE_SIG_PROTECT' out/msm-kernel/sun_perf/msm-kernel/.config
+
+--- a/kernel_platform/common/arch/arm64/configs/gki_defconfig
++++ b/kernel_platform/common/arch/arm64/configs/gki_defconfig
+@@ -103,7 +103,7 @@
+ CONFIG_MODVERSIONS=y
+ CONFIG_MODULE_SCMVERSION=y
+ CONFIG_MODULE_SIG=y
+-CONFIG_MODULE_SIG_PROTECT=y
++# CONFIG_MODULE_SIG_PROTECT is not set
+ CONFIG_MODPROBE_PATH="/system/bin/modprobe"
+ CONFIG_BLK_DEV_ZONED=y
+ CONFIG_BLK_DEV_THROTTLING=y
+--- a/kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
++++ b/kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
+@@ -104,7 +104,7 @@
+ CONFIG_MODVERSIONS=y
+ CONFIG_MODULE_SCMVERSION=y
+ CONFIG_MODULE_SIG=y
+-CONFIG_MODULE_SIG_PROTECT=y
++# CONFIG_MODULE_SIG_PROTECT is not set
+ CONFIG_MODPROBE_PATH="/system/bin/modprobe"
+ CONFIG_BLK_DEV_ZONED=y
+ CONFIG_BLK_DEV_THROTTLING=y

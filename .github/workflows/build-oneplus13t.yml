@@ -1,0 +1,180 @@
+name: build-oneplus13t-kernel
+
+# 一加 13T (PKX110 / sun / SM8750) 官方内核全量编译 —— 跑在 GitHub 托管的 4 vCPU / 16 GB runner 上。
+# 本机只有 4 核 / 7.2 GB，全量 `sun perf` 会 OOM，所以全量编译交给这里；本地只负责改代码。
+#
+# 触发：Actions 页面点 Run workflow，或 push 到 main 且改动落在 patches/ 或 scripts/ 下。
+# 产出：boot.img / dtbo.img / Image / 359 个 .ko + 可直接刷的 AnyKernel3 zip。
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'variants_type'
+        required: true
+        default: 'perf'
+        type: choice
+        options: [perf, consolidate]
+      baseline:
+        description: '基线分支（仅用于标注产物，切换需改 scripts/deps.json）'
+        required: false
+        default: 'sm8750_b_16.0.0_oneplus_13t'
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/build-oneplus13t.yml'
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VARIANT: ${{ inputs.variant || 'perf' }}
+  TREE: ${{ github.workspace }}/oneplus13t-kernel
+  DL: ${{ github.workspace }}/_dl
+
+jobs:
+  build:
+    # 官方基线在 8 核上要 3h12m；4 vCPU 留足余量
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 托管 runner 只有约 14 GB 空闲盘，而构建要 30-60 GB。
+      # 这一步清掉预装的 .NET / Android SDK / Haskell / 大包，通常能腾出 25-30 GB。
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false   # 保留 runner 自带的 swap
+
+      - name: Report runner
+        run: |
+          echo "cores: $(nproc)"; echo "mem:"; free -h; echo "disk:"; df -h /
+
+      # 3.01 GiB 依赖：按 deps.json 的 hash 缓存，命中后重建省 5-8 分钟
+      - name: Cache deps (3.0 GiB)
+        uses: actions/cache@v4
+        with:
+          path: _dl
+          key: 13t-deps-${{ hashFiles('scripts/deps.json') }}
+          restore-keys: 13t-deps-
+
+      - name: Host packages
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential git python3 rsync zip unzip bc bzip2 cpio flex bison \
+            libssl-dev libelf-dev kmod device-tree-compiler file
+
+      - name: Extra swap (LTO thin + 359 vendor modules 峰值很高)
+        run: |
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Assemble official tree (35 deps)
+        run: |
+          python3 scripts/assemble.py --root "$TREE" --arch-dir "$DL" --jobs 4
+          echo "---- tree size:"; du -sh "$TREE"
+          echo "---- entries:"; find "$TREE" -type f | wc -l
+
+      - name: Apply local patches (optional)
+        run: |
+          if [ -d patches ] && ls patches/*.patch >/dev/null 2>&1; then
+            cd "$TREE"
+            for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+              echo "== applying $(basename "$p")"
+              git apply --verbose "$p" || patch -p1 < "$p"
+            done
+          else
+            echo "no patches/ — zero-change baseline build"
+          fi
+
+      - name: Preflight
+        run: |
+          cd "$TREE"
+          for p in kernel_platform/common/Makefile \
+                   kernel_platform/msm-kernel/build.config.msm.sun \
+                   kernel_platform/oplus/build/oplus_build_kernel.sh \
+                   kernel_platform/msm-kernel/arch/arm64/configs/vendor/sun_perf.config; do
+            [ -e "$p" ] && echo "ok   $p" || { echo "MISS $p"; exit 1; }
+          done
+          awk '/^(VERSION|PATCHLEVEL|SUBLEVEL)/{printf "%s%s",(NR>1?".":""),$3}' kernel_platform/common/Makefile; echo
+          [ -L kernel_platform/tools/bazel ] && echo "symlink tools/bazel ok" || echo "WARN tools/bazel not a symlink"
+
+      - name: Build (${{ env.VARIANT }})
+        run: |
+          cd "$TREE"
+          set -o pipefail
+          bash kernel_platform/oplus/build/oplus_build_kernel.sh sun "$VARIANT" 2>&1 | tee build.log
+        # 日志可能上千行，失败时靠下面的产物与 LOGDIR 定位
+
+      - name: Verify artifacts
+        run: |
+          set -e
+          D="$TREE/out/msm-kernel/sun_${VARIANT}/dist"
+          echo "---- dist:"; ls -lh "$D" | head -20
+          test -f "$D/Image"     || { echo "MISSING Image"; exit 1; }
+          test -f "$D/boot.img"  || { echo "MISSING boot.img"; exit 1; }
+          echo "---- kernel version string:"
+          strings "$D/Image" | grep -m3 'Linux version 6\.6\.' || true
+          echo "---- modules:"
+          ls "$D"/*.ko 2>/dev/null | wc -l
+          [ -f "$D/vendor_dlkm.modules.load" ] && wc -l < "$D/vendor_dlkm.modules.load" || true
+          echo "---- critical vendor config (must be 'is not set' or n, else WiFi/BT dies):"
+          for c in "$TREE"/out/msm-kernel/sun_${VARIANT}/msm-kernel/.config \
+                   "$TREE"/out/msm-kernel/sun_${VARIANT}/common/.config; do
+            [ -f "$c" ] && { echo "config: $c"; grep -E 'CONFIG_MODULE_SIG_PROTECT|CONFIG_MODULE_SIG=|CONFIG_MODULE_SIG_KEY' "$c" || true; }
+          done
+          echo "---- boot.img header:"
+          xxd -l 64 "$D/boot.img" || true
+
+      - name: Repack flashable zip (AnyKernel3 skeleton)
+        if: success()
+        run: |
+          D="$TREE/out/msm-kernel/sun_${VARIANT}/dist"
+          if [ -f tools/AnyKernel3-6.6.118-OnePlus13T-v3.6.zip ]; then
+            bash scripts/repack-ak3.sh -k "$D/Image" || true
+          else
+            echo "no AK3 skeleton in repo — skipping zip, artifacts below are still complete"
+          fi
+          mkdir -p out-artifacts
+          cp -v "$D/Image" "$D/boot.img" "$D/dtbo.img" out-artifacts/ 2>/dev/null || true
+          cp -v "$D/vendor_dlkm.modules.load" out-artifacts/ 2>/dev/null || true
+          cp -v build.log out-artifacts/ 2>/dev/null || true
+          ls -lh out-artifacts
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus13t-${{ env.VARIANT }}-${{ github.run_number }}
+          path: |
+            out-artifacts/**
+            kernels/oneplus13t/oneplus13t-*.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Collect build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-fail-${{ github.run_number }}
+          path: |
+            ${{ env.TREE }}/build.log
+            ${{ env.TREE }}/LOGDIR/**
+          if-no-files-found: warn
+          retention-days: 7

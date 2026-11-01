@@ -1,0 +1,8 @@
+src/
+tools/
+_dl/
+out*/
+*.zip
+*.tar.gz
+*.log
+*.exe

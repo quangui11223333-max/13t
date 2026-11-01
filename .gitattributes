@@ -1,0 +1,14 @@
+# 归一化行尾：仓库在 Windows 上维护、在 Linux runner 上构建，
+# 混 CRLF 会让 Actions 里的 .sh 直接 "bad interpreter" 挂掉。
+* text=auto eol=lf
+*.sh    text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.patch text eol=lf
+*.ps1   text eol=crlf
+*.exe   binary
+*.zip   binary
+*.gz    binary
