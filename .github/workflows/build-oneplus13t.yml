@@ -80,6 +80,20 @@ jobs:
           python3 scripts/assemble.py --root "$TREE" --arch-dir "$DL" --jobs 4
           echo "---- tree size:"; du -sh "$TREE"
           echo "---- files:"; find "$TREE" -type f | wc -l
+          # build_with_bazel.py 编前把 msm-kernel 的 GKI 头文件换成指向 common/ 的软链，
+          # 编完用 `git checkout --pathspec-from-file=files_gki_aarch64.txt` 还原。
+          # tarball 解出来的树没有 .git，那一步会刷上千行 pathspec 报错并掩盖真实错误。
+          # 给 msm-kernel 建一个本地 git 基线即可让还原生效（软链会被记为 symlink 模式）。
+          M="$TREE/kernel_platform/msm-kernel"
+          if [ -d "$M" ] && [ ! -d "$M/.git" ]; then
+            git -C "$M" init -q
+            git -C "$M" config user.email ci@localhost
+            git -C "$M" config user.name ci
+            git -C "$M" config core.symlinks true
+            git -C "$M" add -A || true
+            git -C "$M" commit -qm "ci baseline" || true
+            echo "---- msm-kernel git 基线: $(git -C "$M" rev-list --count HEAD 2>/dev/null || echo 0) commit, $(git -C "$M" ls-files | wc -l) files"
+          fi
 
       - name: Apply local patches (optional)
         run: |
@@ -137,9 +151,9 @@ jobs:
           done
           echo "---- version:"
           sed -n 's/^VERSION = //p;s/^PATCHLEVEL = //p;s/^SUBLEVEL = //p' kernel_platform/common/Makefile | paste -sd. -
-          echo "---- SIG_PROTECT in defconfigs (must be 'is not set'):"
+          echo "---- SIG_PROTECT in defconfigs (期望：整行不存在 = 默认 n；出现 'is not set' 会让 savedefconfig 校验失败):"
           grep -H 'MODULE_SIG_PROTECT' kernel_platform/common/arch/arm64/configs/gki_defconfig \
-                                     kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig || true
+                                     kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig || echo "  (两处都已删行，正确)"
           echo "---- oplus/prebuild 内容:"
           ls -la kernel_platform/oplus/prebuild 2>/dev/null | head -15
           exit $fail
@@ -147,8 +161,23 @@ jobs:
       - name: Build (${{ env.VARIANT }})
         run: |
           cd "$TREE"
-          set -o pipefail
+          # oplus_build_kernel.sh 不返回 prepare_vendor.sh 的失败状态（它自己 exit 0），
+          # 所以不能只看退出码 —— 必须从日志里认失效。
+          set +e
           bash kernel_platform/oplus/build/oplus_build_kernel.sh sun "$VARIANT" 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "---- oplus_build_kernel.sh 退出码: $rc"
+          bad=0
+          grep -q 'Build did NOT complete'            build.log && bad=1
+          grep -q 'savedefconfig does not match'      build.log && bad=1
+          grep -q 'ERROR: .*BUILD\.bazel'             build.log && bad=1
+          if [ "$bad" = "1" ] || [ "$rc" != "0" ]; then
+            echo "::error::构建失败（脚本退出码 $rc）—— 真实错误如下:"
+            grep -n 'ERROR\|^error:' build.log | grep -v 'pathspec\|Failed to restore headers' | tail -40 || true
+            exit 1
+          fi
+          echo "---- bazel 通过，继续校验产物"
 
       # 产物路径以 prepare_vendor.sh 头部注释为准（权威）：
       #   KP_OUT = ${ANDROID_BUILD_TOP}/device/qcom/sun-kernel   ← oplus_setup.sh 把 ANDROID_BUILD_TOP=树根
@@ -199,6 +228,21 @@ jobs:
           ls -d "$TREE"/kernel_platform/out/*/dist 2>/dev/null > "$A/dist-dirs.txt" || true
           cp -v "$TREE/build.log" "$A/" 2>/dev/null || true
           echo "---- 收集结果:"; du -sh "$A"; ls -lh "$A" | head -20
+
+      # 有 Image 就顺手打一个 AnyKernel3 可刷 zip（KernelSU/APatch/TWRP 都能刷）。
+      # 失败不影响主产物，只是少一个便利包。
+      - name: Package AnyKernel3 zip
+        if: always()
+        continue-on-error: true
+        run: |
+          O="$TREE/device/qcom/sun-kernel"
+          A="$GITHUB_WORKSPACE/out-artifacts"
+          [ -f "$O/Image" ] || { echo "没有 Image，跳过 AK3 组包"; exit 0; }
+          git clone --depth 1 -q https://github.com/osm0sis/AnyKernel3 /tmp/ak3
+          bash "$GITHUB_WORKSPACE/scripts/make-ak3.sh" \
+               -k "$O/Image" -a /tmp/ak3 \
+               -o "$A/AnyKernel3-OnePlus13T-${{ github.run_number }}.zip" \
+               -s "run${{ github.run_number }}"
 
       - name: Upload artifacts
         if: always()

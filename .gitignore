@@ -8,3 +8,6 @@ out*/
 *.exe
 .ghconfig/
 gh_token*
+
+_ak3/
+out/

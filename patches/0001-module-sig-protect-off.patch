@@ -7,14 +7,27 @@
 于是 rfkill → cfg80211 → mac80211 → qca_cld3_wlan 这条链在 insmod 阶段被拒，
 表现是**开机正常但 WiFi 和蓝牙全哑**，dmesg 里能看到 module signature / protect 相关拒绝。
 
+为什么是"删掉整行"而不是"改成 # ... is not set"
+------------------------------------------------
+kleaf 在 common/BUILD.bazel 的 defconfig 目标上有一条硬校验：跑完
+`make savedefconfig` 之后拿结果跟源码 defconfig 逐行比对，不一致就直接
+
+    ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig
+    ERROR: Build did NOT complete successfully
+
+而 `savedefconfig` 只输出"非默认值"的项。Kconfig 里 `config MODULE_SIG_PROTECT`
+是 `bool`、没有 `default y`（默认 n），所以：
+  - 写成 `# CONFIG_MODULE_SIG_PROTECT is not set` → savedefconfig 不输出这行 → 比对失败 ✗
+  - 直接删掉 `CONFIG_MODULE_SIG_PROTECT=y` → 默认即 n，savedefconfig 也不输出 → 比对通过 ✓
+
 两个 tree 都有这一行，必须同时改（只改一个会被另一份 defconfig 覆盖回去）：
   - kernel_platform/common/arch/arm64/configs/gki_defconfig
   - kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
 
-保留 `CONFIG_MODULE_SIG=y`（只做签名元数据，不拦截），只把 PROTECT 关掉。
+保留 `CONFIG_MODULE_SIG=y`（只做签名元数据，不拦截），只把 PROTECT 去掉。
 
 用法（在装配好的树根目录）
---------------------------
+-------------------------
   patch -p1 < patches/0001-module-sig-protect-off.patch
   # 或： git apply patches/0001-module-sig-protect-off.patch
 
@@ -22,30 +35,39 @@
 ----
   grep -n 'MODULE_SIG' kernel_platform/common/arch/arm64/configs/gki_defconfig
   grep -n 'MODULE_SIG' kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
-  # 两处都应是： CONFIG_MODULE_SIG=y  且  # CONFIG_MODULE_SIG_PROTECT is not set
+  # 两处都应是： CONFIG_MODULE_SIG=y  且  完全没有 MODULE_SIG_PROTECT 这一行
 
-编完再验一次生成的 .config：
-  grep 'MODULE_SIG_PROTECT' out/msm-kernel/sun_perf/msm-kernel/.config
+编完再验一次生成的 .config（必须是 "not set" 或整行缺失）：
+  grep 'MODULE_SIG_PROTECT' /path/to/out/msm-kernel/.config
+
+为什么还要在 msm-kernel 建 git 仓库
+-----------------------------------
+build_with_bazel.py 在编译前会把 msm-kernel 里那批 GKI 头文件换成指向
+common/ 的软链，编完在 finally 里执行
+  git checkout --pathspec-from-file=files_gki_aarch64.txt
+来还原。树是从 tarball 解出来的、没有 .git，于是这一步刷出上千行
+  error: pathspec '...' did not match any file(s) known to git
+  [build_with_bazel.py] ERROR: Failed to restore headers from symlinks
+它不中断构建（只是收尾告警），但会掩盖真实错误。给 msm-kernel 建一个本地
+git 仓库即可让还原真正生效。
 
 --- a/kernel_platform/common/arch/arm64/configs/gki_defconfig
 +++ b/kernel_platform/common/arch/arm64/configs/gki_defconfig
-@@ -103,7 +103,7 @@
+@@ -103,7 +103,6 @@
  CONFIG_MODVERSIONS=y
  CONFIG_MODULE_SCMVERSION=y
  CONFIG_MODULE_SIG=y
 -CONFIG_MODULE_SIG_PROTECT=y
-+# CONFIG_MODULE_SIG_PROTECT is not set
  CONFIG_MODPROBE_PATH="/system/bin/modprobe"
  CONFIG_BLK_DEV_ZONED=y
  CONFIG_BLK_DEV_THROTTLING=y
 --- a/kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
 +++ b/kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
-@@ -104,7 +104,7 @@
+@@ -104,7 +104,6 @@
  CONFIG_MODVERSIONS=y
  CONFIG_MODULE_SCMVERSION=y
  CONFIG_MODULE_SIG=y
 -CONFIG_MODULE_SIG_PROTECT=y
-+# CONFIG_MODULE_SIG_PROTECT is not set
  CONFIG_MODPROBE_PATH="/system/bin/modprobe"
  CONFIG_BLK_DEV_ZONED=y
  CONFIG_BLK_DEV_THROTTLING=y
