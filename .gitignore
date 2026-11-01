@@ -6,3 +6,5 @@ out*/
 *.tar.gz
 *.log
 *.exe
+.ghconfig/
+gh_token*

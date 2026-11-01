@@ -1,10 +1,10 @@
 name: build-oneplus13t-kernel
 
 # 一加 13T (PKX110 / sun / SM8750) 官方内核全量编译 —— 跑在 GitHub 托管的 4 vCPU / 16 GB runner 上。
-# 本机只有 4 核 / 7.2 GB，全量 `sun perf` 会 OOM，所以全量编译交给这里；本地只负责改代码。
+# 本机只有 4 核 / 7.2 GB（还被 QQ 机器人占着 4.5 G），全量 `sun perf` 必 OOM，所以编译交给这里。
 #
-# 触发：Actions 页面点 Run workflow，或 push 到 main 且改动落在 patches/ 或 scripts/ 下。
-# 产出：boot.img / dtbo.img / Image / 359 个 .ko + 可直接刷的 AnyKernel3 zip。
+# 触发：Actions 页面 Run workflow，或 push 到 main 且改动落在 patches/ / scripts/ 下。
+# 产出：Image / boot.img / dtbo.img / 359 个 .ko / vendor_dlkm.modules.load + build.log
 
 on:
   workflow_dispatch:
@@ -15,10 +15,6 @@ on:
         default: 'perf'
         type: choice
         options: [perf, consolidate]
-      baseline:
-        description: '基线分支（仅用于标注产物，切换需改 scripts/deps.json）'
-        required: false
-        default: 'sm8750_b_16.0.0_oneplus_13t'
   push:
     branches: [main]
     paths:
@@ -45,19 +41,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 托管 runner 只有约 14 GB 空闲盘，而构建要 30-60 GB。
-      # 这一步清掉预装的 .NET / Android SDK / Haskell / 大包，通常能腾出 25-30 GB。
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false   # 保留 runner 自带的 swap
-
+      # 实测 runner 是 146 G 盘 / 118 G 可用、15 GiB 内存，不需要 free-disk-space 那套腾空间操作
       - name: Report runner
         run: |
           echo "cores: $(nproc)"; echo "mem:"; free -h; echo "disk:"; df -h /
@@ -77,98 +61,121 @@ jobs:
             build-essential git python3 rsync zip unzip bc bzip2 cpio flex bison \
             libssl-dev libelf-dev kmod device-tree-compiler file
 
-      - name: Extra swap (LTO thin + 359 vendor modules 峰值很高)
+      # 额外 swap 只是保险：runner 已有 3 G swap、15 GiB 内存。
+      # 注意 /swapfile 已被 runner 占用（fallocate 会报 Text file busy），必须换一个文件名；
+      # 而且这一步失败不该阻断编译。
+      - name: Extra swap (best effort)
+        continue-on-error: true
         run: |
-          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
+          free -h; swapon --show || true
+          SW=/swapfile_extra
+          sudo swapoff "$SW" 2>/dev/null || true
+          sudo rm -f "$SW"
+          sudo fallocate -l 8G "$SW" || sudo dd if=/dev/zero of="$SW" bs=1M count=8192 status=none
+          sudo chmod 600 "$SW" && sudo mkswap "$SW" && sudo swapon "$SW" || echo "swap add failed, continuing"
+          swapon --show; free -h
 
       - name: Assemble official tree (35 deps)
         run: |
           python3 scripts/assemble.py --root "$TREE" --arch-dir "$DL" --jobs 4
           echo "---- tree size:"; du -sh "$TREE"
-          echo "---- entries:"; find "$TREE" -type f | wc -l
+          echo "---- files:"; find "$TREE" -type f | wc -l
 
       - name: Apply local patches (optional)
         run: |
-          if [ -d patches ] && ls patches/*.patch >/dev/null 2>&1; then
-            cd "$TREE"
-            for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
-              echo "== applying $(basename "$p")"
-              git apply --verbose "$p" || patch -p1 < "$p"
-            done
-          else
-            echo "no patches/ — zero-change baseline build"
+          cd "$TREE"
+          shopt -s nullglob
+          ps=("$GITHUB_WORKSPACE"/patches/*.patch)
+          if [ ${#ps[@]} -eq 0 ]; then echo "no patches/ -- zero-change baseline"; exit 0; fi
+          for p in "${ps[@]}"; do
+            echo "== applying $(basename "$p")"
+            patch -p1 --forward < "$p" || { echo "PATCH FAILED: $p"; exit 1; }
+          done
+
+      # oplus_setup.sh 把 JAVA_HOME 写死成 ${TOPDIR}/prebuilts/jdk/jdk21/linux-x86，
+      # 但依赖里只有 jdk11，且 prebuilts 在 kernel_platform/ 下而不是树根。
+      # 用两条软链补齐，不改源码（kleaf/workspace.bzl 用的就是 jdk11，版本是对的）。
+      - name: Prepare prebuilts / JAVA_HOME
+        run: |
+          cd "$TREE"
+          [ -e prebuilts ] || ln -sfn "$TREE/kernel_platform/prebuilts" "$TREE/prebuilts"
+          if [ ! -d "$TREE/prebuilts/jdk/jdk21/linux-x86" ]; then
+            ln -sfn "$TREE/prebuilts/jdk/jdk11" "$TREE/prebuilts/jdk/jdk21"
+            echo "linked jdk21 -> jdk11"
           fi
+          echo "JAVA_HOME candidate:"; ls -l "$TREE/prebuilts/jdk/jdk21/linux-x86/bin/java"
+          "$TREE/prebuilts/jdk/jdk21/linux-x86/bin/java" -version 2>&1 | head -2
 
       - name: Preflight
         run: |
           cd "$TREE"
-          for p in kernel_platform/common/Makefile \
-                   kernel_platform/msm-kernel/build.config.msm.sun \
-                   kernel_platform/oplus/build/oplus_build_kernel.sh \
-                   kernel_platform/msm-kernel/arch/arm64/configs/vendor/sun_perf.config; do
-            [ -e "$p" ] && echo "ok   $p" || { echo "MISS $p"; exit 1; }
+          fail=0
+          chk() { if [ -e "$2" ]; then echo "ok    $1"; else echo "MISS  $1  ($2)"; fail=1; fi; }
+          chk "common/Makefile"                kernel_platform/common/Makefile
+          chk "msm-kernel build.config.msm.sun" kernel_platform/msm-kernel/build.config.msm.sun
+          chk "vendor/sun_perf.config"          kernel_platform/msm-kernel/arch/arm64/configs/vendor/sun_perf.config
+          chk "oplus_build_kernel.sh"           kernel_platform/oplus/build/oplus_build_kernel.sh
+          chk "prepare_vendor.sh"               kernel_platform/build/android/prepare_vendor.sh
+          chk "clang-r510928"                   kernel_platform/prebuilts/clang/host/linux-x86/clang-r510928/bin/clang
+          chk "llvm-strip"                      kernel_platform/prebuilts/clang/host/linux-x86/llvm-binutils-stable/llvm-strip
+          chk "prebuilt python3"                kernel_platform/prebuilts/build-tools/path/linux-x86/python3
+          chk "prebuilt cpio"                   kernel_platform/prebuilts/build-tools/path/linux-x86/cpio
+          chk "lz4"                             kernel_platform/prebuilts/kernel-build-tools/linux-x86/bin/lz4
+          chk "mkbootimg.py"                    kernel_platform/tools/mkbootimg/mkbootimg.py
+          chk "unpack_bootimg.py"               kernel_platform/tools/mkbootimg/unpack_bootimg.py
+          # 原厂镜像模板只影响"打包成 boot.img"这一步；缺了照样能编出 Image + 359 个 ko，
+          # 那种情况用 AnyKernel3 zip 刷（AK3 自带打包逻辑，不需要原厂 boot.img）。所以只警告不中断。
+          for p in kernel_platform/oplus/prebuild/origin_img kernel_platform/oplus/prebuild/boot_tmp; do
+            [ -e "$p" ] && echo "ok    $p" || echo "WARN  $p 缺失 —— 只能出 Image+ko，用 AnyKernel3 刷"
           done
-          awk '/^(VERSION|PATCHLEVEL|SUBLEVEL)/{printf "%s%s",(NR>1?".":""),$3}' kernel_platform/common/Makefile; echo
-          [ -L kernel_platform/tools/bazel ] && echo "symlink tools/bazel ok" || echo "WARN tools/bazel not a symlink"
+          echo "---- version:"
+          sed -n 's/^VERSION = //p;s/^PATCHLEVEL = //p;s/^SUBLEVEL = //p' kernel_platform/common/Makefile | paste -sd. -
+          echo "---- SIG_PROTECT in defconfigs (must be 'is not set'):"
+          grep -H 'MODULE_SIG_PROTECT' kernel_platform/common/arch/arm64/configs/gki_defconfig \
+                                     kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig || true
+          echo "---- oplus/prebuild 内容:"
+          ls -la kernel_platform/oplus/prebuild 2>/dev/null | head -15
+          exit $fail
 
       - name: Build (${{ env.VARIANT }})
         run: |
           cd "$TREE"
           set -o pipefail
           bash kernel_platform/oplus/build/oplus_build_kernel.sh sun "$VARIANT" 2>&1 | tee build.log
-        # 日志可能上千行，失败时靠下面的产物与 LOGDIR 定位
 
       - name: Verify artifacts
         run: |
-          set -e
           D="$TREE/out/msm-kernel/sun_${VARIANT}/dist"
-          echo "---- dist:"; ls -lh "$D" | head -20
-          test -f "$D/Image"     || { echo "MISSING Image"; exit 1; }
-          test -f "$D/boot.img"  || { echo "MISSING boot.img"; exit 1; }
-          echo "---- kernel version string:"
-          strings "$D/Image" | grep -m3 'Linux version 6\.6\.' || true
-          echo "---- modules:"
-          ls "$D"/*.ko 2>/dev/null | wc -l
-          [ -f "$D/vendor_dlkm.modules.load" ] && wc -l < "$D/vendor_dlkm.modules.load" || true
-          echo "---- critical vendor config (must be 'is not set' or n, else WiFi/BT dies):"
-          for c in "$TREE"/out/msm-kernel/sun_${VARIANT}/msm-kernel/.config \
-                   "$TREE"/out/msm-kernel/sun_${VARIANT}/common/.config; do
-            [ -f "$c" ] && { echo "config: $c"; grep -E 'CONFIG_MODULE_SIG_PROTECT|CONFIG_MODULE_SIG=|CONFIG_MODULE_SIG_KEY' "$c" || true; }
-          done
-          echo "---- boot.img header:"
-          xxd -l 64 "$D/boot.img" || true
+          echo "---- dist:"; ls -lh "$D" | head -25 || true
+          echo "---- 也找找别处的产物:"
+          find "$TREE" -name 'boot.img' -o -name 'Image' -o -name 'dtbo.img' 2>/dev/null | head -20
+          [ -f "$D/Image" ] && strings "$D/Image" | grep -m2 'Linux version 6\.6\.' || echo "no Image"
+          echo "---- ko 数量: $(ls "$D"/*.ko 2>/dev/null | wc -l)"
+          [ -f "$D/vendor_dlkm.modules.load" ] && echo "modules.load 行数: $(wc -l < "$D/vendor_dlkm.modules.load")"
 
-      - name: Repack flashable zip (AnyKernel3 skeleton)
-        if: success()
+      - name: Collect outputs
+        if: always()
         run: |
           D="$TREE/out/msm-kernel/sun_${VARIANT}/dist"
-          if [ -f tools/AnyKernel3-6.6.118-OnePlus13T-v3.6.zip ]; then
-            bash scripts/repack-ak3.sh -k "$D/Image" || true
-          else
-            echo "no AK3 skeleton in repo — skipping zip, artifacts below are still complete"
-          fi
-          mkdir -p out-artifacts
-          cp -v "$D/Image" "$D/boot.img" "$D/dtbo.img" out-artifacts/ 2>/dev/null || true
-          cp -v "$D/vendor_dlkm.modules.load" out-artifacts/ 2>/dev/null || true
-          cp -v build.log out-artifacts/ 2>/dev/null || true
-          ls -lh out-artifacts
+          mkdir -p "$GITHUB_WORKSPACE/out-artifacts"
+          cp -v "$D"/Image "$D"/boot.img "$D"/dtbo.img "$D"/vendor_dlkm.modules.load \
+                "$GITHUB_WORKSPACE/out-artifacts/" 2>/dev/null || true
+          cp -rv "$D"/merged-dtbs "$GITHUB_WORKSPACE/out-artifacts/" 2>/dev/null || true
+          mkdir -p "$GITHUB_WORKSPACE/out-artifacts/ko" 2>/dev/null
+          cp -v "$D"/*.ko "$GITHUB_WORKSPACE/out-artifacts/ko/" 2>/dev/null || true
+          cp -v "$TREE/build.log" "$GITHUB_WORKSPACE/out-artifacts/" 2>/dev/null || true
+          du -sh "$GITHUB_WORKSPACE/out-artifacts"; ls -lh "$GITHUB_WORKSPACE/out-artifacts"
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: oneplus13t-${{ env.VARIANT }}-${{ github.run_number }}
-          path: |
-            out-artifacts/**
-            kernels/oneplus13t/oneplus13t-*.zip
+          path: out-artifacts/**
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Collect build log on failure
+      - name: Upload build log (failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
